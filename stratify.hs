@@ -14,6 +14,7 @@ import Unbound.LocallyNameless
 import Data.String
 import qualified Data.Map as Map
 import Data.Map (Map)
+import Data.Graph.Inductive
 import qualified Text.PrettyPrint as PP
 import Text.PrettyPrint (Doc, (<+>), (<>))
 import Control.Applicative
@@ -32,7 +33,7 @@ As a warmup, we consider only systems on the lambda cube.
 -}
 
 data Sort = Star | Box
-    deriving (Eq, Show, Ord)
+    deriving (Eq, Show, Ord, Enum)
 data Axiom = Sort :~ Sort
     deriving (Eq, Show)
 afst (x :~ _) = x
@@ -49,6 +50,8 @@ data Judgment = Judgment [Statement] Statement
     deriving (Show)
 data Statement = Typed Term Term | Context
     deriving (Show)
+
+sorts = [Star, Box]
 
 (.|-) = Judgment
 (.:) = Typed
@@ -218,72 +221,118 @@ lafresh x m = do
 
 HOW DO YOU REMOVE UNUSED ELEMENTS FROM THE CONTEXT?
 
-The key is to focus on the variable introduction rules:
-if it is not possible to introduce a variable under some sort
-for another context, then they can be erased.
+The canonical example of wanting to remove unused elements
+is the difference between λ→ and λP.  For SLTC, we would
+like the Π rule to be written with arrows, since the binder
+is always free; with dependence, however, we need full Π-types.
 
-Algorithmically, whenever constructing a pi rule (and the pi-terms of
-the lambda rule) for (s₁, s₂), we check if (s₁, typeof s₂) is fulfilled.
-As an example, consider the generation of (*,*) rule.  The binder
-requires (*,☐) to be present in order to be applicable.
+How can we tell when the binder is always free?  Looking at
+the derivation trees, we are wondering:
+
+        -----------
+        Γ, Δ ⊢ A:s₁
+      ---------------
+      Γ, x:A, Δ ⊢ x:A  ??
+      ---------------
+            ....
+    --------------------
+      Γ, x:A:s₁ ⊢ B:s₂
+
+i.e. could our proof tree ever end up using this particular proof term?
+This is equivalent to asking whether or not A will ever become a goal in
+the derivation.
+
+So, how can we conclude that a rule will never show up?  We generate
+a directed graph and consider connectivity.  For each rule (s₁, s₂)
+we add an edge x → y to the graph, read 'When proving a goal of sort x,
+one may need to prove a goal of sort y (where proof term : goal : sort)',
+filling in the trivial reflexive relations.
+
+    start:      s → s
+    universal:  s → typeof s
+    app-rule:   s₂ → s₁
+    Π-rule:     typeof s₂ → typeof s₁
+    λ-rule:     s₂ → typeof s₁, typeof s₂
+
+In fact, we can simplify this: as universal paths exist taking
+s to typeof s, the only modified paths are s₂ → s₁ and typeof s₂ → typeof s₁
+when there does not already exist a universal path. (In the lambda
+cube, the typeof s₂ → typeof s₁ paths are trivial, but they are not
+necessarily... however, it does require such shenanigans as a Π term
+being allowed to have two different types.)
+
+To conclude that the Π-rule for some pair (s₁, s₂) will never use it's
+variable, we must show that there is no path from 'typeof s₂ → s₁'.
+
+Example 1: For λ→, we have the freely generated graph:
+
+    * → *, ☐
+    ☐ → ☐
+
+For (*, *), there is no path ☐ → *, thus the binding may be dropped.
+
+Example 2: For λ2, the graph is the same, as no backwards edges are
+added. (*, *) is unchanged, but the new relation (*, ☐) trivially has
+a path (thus requiring the polymorphic ∀ operator.)
+
+Example 3: For λC, the rule (*, ☐) completes the graph.
+
+    * → *, ☐
+    ☐ → *, ☐
+
+(*, *)  now does have its path ☐ → *, and the binding is necessary.
+However, (☐, ☐) does NOT have a path, as typeof ☐ is not defined
+on the lambda cube.  Put another way, there is no kind polymorphism
+on the lambda cube, even in λC!
 
 E E F G D C A G Eb D C
 
-This should make it clear that λC has some problems: it doesn't
-have an infinite number of universes!
-
 -}
 
-arrOnly rels s1 s2 = maybe False (\s2' -> (s1 :. s2') `elem` rels) (sortOf s2)
+sortGraph :: [Relation] -> UGr
+sortGraph rels = mkGraph (map (\x -> (fromEnum x, ())) sorts)
+                         (map (\(s1 :. s2) -> (fromEnum s2, fromEnum s1, ())) rels
+                            ++ concatMap (\s -> maybe [] (\s' -> [(fromEnum s, fromEnum s', ())]) (sortOf s)) sorts)
 
-jPi p =
-    [ [Context] .|- "A" .: "s₁"
-    , ([Context] ++ if p then ["x" .: "A"] else []) .|- "B" .: "s₂"
-    ] .=> [Context] .|- (if p then Pi "x" "A" "B" else Arr "A" "B") .: "s₂"
-jLambda p =
-    [ [Context] .|- "A" .: "s₁"
-    , [Context, "x" .: "A"] .|- "b" .: "B"
-    , ([Context] ++ if p then ["x" .: "A"] else []) .|- "B" .: "s₂"
-    ] .=> [Context] .|- Lambda "x" "A" "b" .: (if p then Pi "x" "A" "B" else Arr "A" "B")
+needPiBinder rels s1 s2 =
+    maybe False (\s3 -> s1 == s3 || fromEnum s1 `elem` dfs [fromEnum s3] (sortGraph rels)) (sortOf s2)
+
+jPi ta tb b s1 s2 x p =
+    [ [Context] .|- ta .: s1
+    , ([Context] ++ if p then [x .: ta] else []) .|- tb .: s2
+    ] .=> [Context] .|- (if p then Pi x ta tb else Arr ta tb) .: s2
+jLambda ta tb b s1 s2 x p =
+    [ [Context] .|- ta .: s1
+    , [Context, x .: ta] .|- b .: tb
+    , ([Context] ++ if p then [x .: ta] else []) .|- tb .: s2
+    ] .=> [Context] .|- Lambda x ta tb .: (if p then Pi x ta tb else Arr ta tb)
 
 make (s1 :. s2) rels rule = runLFreshM $
     lafresh (meta_name (over s1)) $ \ta -> -- le freak!
     lafresh (meta_name (over s2)) $ \tb ->
     lafresh (meta_name (under s2)) $ \b ->
     lafresh (var_name (under s1)) $ \x ->
-    return $ substs
-        [ ("A", Var ta)
-        , ("B", Var tb)
-        , ("b", Var b)
-        , ("s₁", Sort s1)
-        , ("s₂", Sort s2)
-        , ("x", Var x)
-        ] (rule (arrOnly rels s1 s2))
+    return $ rule (Var ta) (Var tb) (Var b) (Sort s1) (Sort s2) (Var x) (needPiBinder rels s1 s2)
 
 {-
 
 HOW DO YOU GENERATE THE GRAMMAR?
 
 For the λ-cube, it is adequate to generate a grammar for each sort, as
-well as a grammar for terms (which are under types).
+well as a grammar for terms (which are under types).  The idea is
+that if a production could not possibly well-typed under the rules,
+then it is omitted from the grammar.
 
-Pi/Lambda productions may be eliminated if they are not allowed
-by the relations.  A pi-term is permissible in sort s if (_, s)
-is present in the relations. A lambda-term is permissible in sort
-s if (_, typeof s) is present in the relations (in particular, if
-the sort is at the top of a hierarchy, no lambda terms are allowed,
-since we cannot type their pi terms!)
+Π/λ productions are allowed exactly per the relations, except that λ
+terms are "one under" their relation, i.e. a lambda term is permissible
+in sort s if we have the relation (_, typeof s).  If the hierarchy has a
+top, no lambda terms are permitted (what would their type be?)  The
+application production is symmetric to the λ production.
 
-Similarly as before, some pi productions are replaced with arrow
-productions as determined by the previous section.
-
-Additionally, some productions need to be duplicated as they are
-instantiated by multiple relations:
-
-    * Lambda, considering what the binder is under, and symmetrically,
-      App.
-    * Pi, considering what the binder is under (this is only
-      really relevant λC, since so many pis trivialize)
+There is some delicacy dealing with variable binding.  We can reuse
+our logic for when Π is bindable, but we must also allow for lambda
+binding; that is to say, if it is possible for some lambda to bind
+a properly sorted variable, then we must include the variable production.
 
 -}
 
@@ -291,7 +340,7 @@ grammar s rels = Grammar (meta_name s) . execWriter $ do
     let calc_rels p = filter (\r -> p (rel2 r) == s) rels
         lambda_rels = calc_rels under
         pi_rels     = calc_rels over
-    when (not (null lambda_rels)) $ tell [Var (var_name s)]
+    when (not (null (lambda_rels ++ filter (\(s1 :. s2) -> needPiBinder rels s1 s2) pi_rels))) $ tell [Var (var_name s)]
     tell . map (Sort . afst) . filter (\a -> Just (asnd a) == s) $ axioms
     tell . concatMap (\(s1 :. s2) ->
             [ (if s1 == Box then TyLambda else Lambda) -- hack!
@@ -302,7 +351,7 @@ grammar s rels = Grammar (meta_name s) . execWriter $ do
             ])
          $ lambda_rels
     tell . map (\(s1 :. s2) ->
-            if arrOnly rels s1 s2
+            if needPiBinder rels s1 s2
                 then Pi (var_name (under s1))
                      (meta_name (over s1))
                      (meta_name (over s2))
