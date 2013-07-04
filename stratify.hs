@@ -10,7 +10,7 @@
            , NoMonomorphismRestriction
            , OverloadedStrings
            #-}
-import Unbound.LocallyNameless
+import Unbound.LocallyNameless -- used only for LFresh
 import Data.String
 import qualified Data.Map as Map
 import Data.Map (Map)
@@ -61,47 +61,23 @@ infixr .|-, :~, :., .=>, .:
 
 -- technically a pseudoterm
 -- we DON'T use binders because we care about how these so-called "binders" are named
--- this is all terribly unsound, subst for conveniently renaming stuff
-{- Results in:
-
-stratify.hs:64:3:
-    Warning: Duplicate constraint(s): Sat (ctx_axVY Term)
-    In the context: (Sat (ctx_axVY (Name Term)),
-                     Sat (ctx_axVY Sort),
-                     Sat (ctx_axVY Term),
-                     Sat (ctx_axVY X))
-    While checking an instance declaration
-    In the instance declaration for `Rep1 ctx_axVY Term'
--}
-type X = Term -- EW EW EW
+-- so it's pretty unsound!
 data Term = Var (Name Term)
           | Sort Sort
           | App Term Term
-          | Lambda X Term Term
-          | TyLambda X Term Term -- lol notation
-          | Pi X Term Term
+          | Lambda (Name Term) Term Term
+          | TyLambda (Name Term) Term Term -- lol notation
+          | Pi (Name Term) Term Term
           | Arr Term Term
-          | Subst X Term Term -- fake
+          | Subst (Name Term) Term Term -- fake
     deriving (Show)
 
-$(derive [''Sort, ''Term, ''Statement, ''Judgment, ''Rule])
-instance Alpha Sort
-instance Alpha Term
-instance Alpha Statement
-instance Alpha Judgment
-instance Alpha Rule
-instance Subst Term Sort where
-instance Subst Term Term where
-    isvar (Var v) = Just (SubstName v)
-    isvar _ = Nothing
-instance Subst Term Statement where
-instance Subst Term Judgment where
-instance Subst Term Rule where
+$(derive [''Sort, ''Term])
+
 instance IsString (Name Term) where fromString = string2Name
 instance IsString Term where fromString = Var . fromString
 
-nv = fmap Var . lfresh
-
+{-
 jAxiom = [] .=> [] .|- Sort Star .: Sort Box
 jStart =
     [[Context] .|- "A" .: "s"] .=> [Context, "x" .: "A"] .|- "x" .: "A"
@@ -110,6 +86,7 @@ jApp =
     [ [Context] .|- "M" .: Pi "x" "A" "B"
     , [Context] .|- "N" .: "A"
     ] .=> [Context] .|- App "M" "N" .: Subst "x" "B" "N"
+-}
 
 class Pretty p where
     ppr :: Int -> p -> Doc
@@ -120,6 +97,9 @@ ppshow = PP.render . ppr 0
 instance Pretty Sort where
     ppr _ Box = PP.text "☐"
     ppr _ Star = PP.text "★"
+
+instance Pretty (Name a) where
+    ppr _ n = PP.text (show n)
 
 instance Pretty Term where
     ppr _ (Var n) = PP.text (show n)
@@ -156,23 +136,26 @@ sortOf Star = Just Box
 sortOf Box = Nothing
 
 λarr = [Star :. Star]
-λ2 = [Star :. Star, Box :. Star] -- polymorphic lambda calculus
-λω = [Star :. Star, Box :. Star, Box :. Box]
+λ2 = [Star :. Star, Box :. Star] -- System F
+λω = [Star :. Star, Box :. Star, Box :. Box] -- System Fω
 λC = [Star :. Star, Box :. Star, Box :. Box, Star :. Box]
 
 {-
 
 WHAT DO YOU NEED TO DO?
 
-  [X] We want to remove elements from the context, as they
+  [X] We want to stratify pseudoterms into multiple levels classified by
+      sorts.
+
+  [X] We want to rename metavariables according to the
+      stratification.
+
+  [X] We want to remove elements from the context, if they
       are guaranteed to be unused.
 
   [X] We want to replace Pi's with arrows when the variable is
       free (related to the previous thing, it is a case of which
       side of the turnstile you are on).
-
-  [X] We want to rename metavariables according to the
-      stratification.
 
   [X] We want to remove cases from grammar that cannot exist (since they
       have no relevant items), e.g. Pi at the term level.
@@ -206,8 +189,6 @@ var_name Nothing = "x"
 var_name (Just Star) = "α"
 var_name (Just Box) = "X"
 
--- nomenclature: we refer to 'x as under s' if 'x:?:s'; that is,
--- 's is the type of the type of x'
 under Star = Nothing
 under Box = (Just Star)
 
@@ -227,7 +208,7 @@ like the Π rule to be written with arrows, since the binder
 is always free; with dependence, however, we need full Π-types.
 
 How can we tell when the binder is always free?  Looking at
-the derivation trees, we are wondering:
+the derivation trees, we are looking for these situations:
 
         -----------
         Γ, Δ ⊢ A:s₁
@@ -242,11 +223,14 @@ i.e. could our proof tree ever end up using this particular proof term?
 This is equivalent to asking whether or not A will ever become a goal in
 the derivation.
 
-So, how can we conclude that a rule will never show up?  We generate
-a directed graph and consider connectivity.  For each rule (s₁, s₂)
-we add an edge x → y to the graph, read 'When proving a goal of sort x,
-one may need to prove a goal of sort y (where proof term : goal : sort)',
-filling in the trivial reflexive relations.
+So, how can we conclude that a rule will never show up?  One strategy is
+to generate a directed graph and pose the question as a connectivity
+issue.  That is, the edges x → y to the graph indicate 'When proving a
+goal of sort x, one may need to prove a goal of sort y (where proof term
+: goal : sort)'.
+
+These edges can be read off fairly directly from the rules. Here are
+a few (omitting the reflexive relations):
 
     start:      s → s
     universal:  s → typeof s
@@ -254,22 +238,23 @@ filling in the trivial reflexive relations.
     Π-rule:     typeof s₂ → typeof s₁
     λ-rule:     s₂ → typeof s₁, typeof s₂
 
-In fact, we can simplify this: as universal paths exist taking
-s to typeof s, the only modified paths are s₂ → s₁ and typeof s₂ → typeof s₁
-when there does not already exist a universal path. (In the lambda
-cube, the typeof s₂ → typeof s₁ paths are trivial, but they are not
-necessarily... however, it does require such shenanigans as a Π term
-being allowed to have two different types.)
+In fact, we can simplify these rules: with the universal paths exist
+taking s to typeof s, the only modified paths are s₂ → s₁ and typeof s₂
+→ typeof s₁ when there does not already exist a universal path. (In the
+lambda cube, the typeof s₂ → typeof s₁ paths are trivial, but they are
+not necessarily... however, any system which permits this gives up
+*unicity of types*, which is a stiff pill to swallow.)
 
-To conclude that the Π-rule for some pair (s₁, s₂) will never use it's
+Finally, to conclude that the Π-rule for some pair (s₁, s₂) will never use it's
 variable, we must show that there is no path from 'typeof s₂ → s₁'.
 
-Example 1: For λ→, we have the freely generated graph:
+Example 1: For λ→, we have the generated graph:
 
     * → *, ☐
     ☐ → ☐
 
-For (*, *), there is no path ☐ → *, thus the binding may be dropped.
+Notice there are no non-trivial relations.  For (*, *), there is no path
+☐ → *, thus the binding may be dropped.
 
 Example 2: For λ2, the graph is the same, as no backwards edges are
 added. (*, *) is unchanged, but the new relation (*, ☐) trivially has
@@ -299,20 +284,20 @@ needPiBinder rels s1 s2 =
 
 jPi ta tb b s1 s2 x p =
     [ [Context] .|- ta .: s1
-    , ([Context] ++ if p then [x .: ta] else []) .|- tb .: s2
+    , ([Context] ++ if p then [Var x .: ta] else []) .|- tb .: s2
     ] .=> [Context] .|- (if p then Pi x ta tb else Arr ta tb) .: s2
 jLambda ta tb b s1 s2 x p =
     [ [Context] .|- ta .: s1
-    , [Context, x .: ta] .|- b .: tb
-    , ([Context] ++ if p then [x .: ta] else []) .|- tb .: s2
-    ] .=> [Context] .|- Lambda x ta tb .: (if p then Pi x ta tb else Arr ta tb)
+    , [Context, Var x .: ta] .|- b .: tb
+    , ([Context] ++ if p then [Var x .: ta] else []) .|- tb .: s2
+    ] .=> [Context] .|- Lambda x ta b .: (if p then Pi x ta tb else Arr ta tb)
 
 make (s1 :. s2) rels rule = runLFreshM $
     lafresh (meta_name (over s1)) $ \ta -> -- le freak!
     lafresh (meta_name (over s2)) $ \tb ->
     lafresh (meta_name (under s2)) $ \b ->
     lafresh (var_name (under s1)) $ \x ->
-    return $ rule (Var ta) (Var tb) (Var b) (Sort s1) (Sort s2) (Var x) (needPiBinder rels s1 s2)
+    return $ rule (Var ta) (Var tb) (Var b) (Sort s1) (Sort s2) x (needPiBinder rels s1 s2)
 
 {-
 
@@ -336,14 +321,14 @@ a properly sorted variable, then we must include the variable production.
 
 -}
 
-grammar s rels = Grammar (meta_name s) . execWriter $ do
+production s rels = Grammar (meta_name s) . execWriter $ do
     let calc_rels p = filter (\r -> p (rel2 r) == s) rels
         lambda_rels = calc_rels under
         pi_rels     = calc_rels over
     when (not (null (lambda_rels ++ filter (\(s1 :. s2) -> needPiBinder rels s1 s2) pi_rels))) $ tell [Var (var_name s)]
     tell . map (Sort . afst) . filter (\a -> Just (asnd a) == s) $ axioms
     tell . concatMap (\(s1 :. s2) ->
-            [ (if s1 == Box then TyLambda else Lambda) -- hack!
+            [ Lambda
               (var_name (under s1))
               (meta_name (over s1))
               (meta_name (under s2))
@@ -357,6 +342,20 @@ grammar s rels = Grammar (meta_name s) . execWriter $ do
                      (meta_name (over s2))
                 else Arr (meta_name (over s1)) (meta_name (over s2)))
          $ pi_rels
+
+-- putting it all together
+
+a $$ b = a PP.$$ PP.text "" PP.$$ b
+
+grammar rels =
+    ppr 0 (production Nothing rels) $$
+    ppr 0 (production (Just Star) rels) $$
+    ppr 0 (production (Just Box) rels)
+
+{-
+    foldl ($$) PP.empty (map (\rel -> ppr 0 (make rel rels jLambda)) rels) $$
+    foldl ($$) PP.empty (map (\rel -> ppr 0 (make rel rels jPi)) rels)
+    -}
 
 {-
 
